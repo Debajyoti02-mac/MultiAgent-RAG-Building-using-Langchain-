@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+Database_VD/
+.env
+.DS_Store
+.system_generated/
+scratch/
