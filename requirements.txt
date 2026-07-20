@@ -16,3 +16,7 @@ python-dotenv==1.2.2
 
 # Search Tool Dependency
 ddgs==9.14.4
+
+# Streamlit UI
+streamlit
+
