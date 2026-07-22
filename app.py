@@ -5,13 +5,163 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 import chromadb
 
-# Import core agent functionality
-from rag_agent import (
-    get_chroma_client,
-    get_collection,
-    run_agent,
-    ingest_pdf
-)
+# Core agent functionality
+import uuid
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.tools import tool
+
+def get_chroma_client():
+    import chromadb
+    return chromadb.PersistentClient(path="./Database_VD")
+
+def get_collection(client):
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+    embedding_function = DefaultEmbeddingFunction()
+    return client.get_or_create_collection(name="clean_vectorDB", embedding_function=embedding_function)
+
+def ingest_pdf(pdf_path, collection):
+    loader = PyPDFLoader(pdf_path)
+    pages = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=140)
+    texts = text_splitter.split_documents(pages)
+    chunks = [i.page_content for i in texts]
+    metadata = [i.metadata for i in texts]
+    
+    ids = [str(uuid.uuid4()) for _ in range(len(chunks))]
+    collection.add(
+        documents=chunks,
+        ids=ids,
+        metadatas=metadata
+    )
+    return len(chunks)
+
+def run_agent(query, collection, chat_model, state=None):
+    if state is None:
+        state = {"history": []}
+    
+    # 1. Classify route
+    route_prompt = f"""You are a query router for a multi-agent system.
+Your job is to classify the user's query into one of three routes:
+1. "Calculator" - Use this for mathematical calculations (e.g. arithmetic expressions like "23 * 78", "what is 54 + 2", "123 / 3").
+2. "Local PDF Retrieval" - Use this for questions about economics, research papers, custom documents, or anything that sounds like a reference retrieval.
+3. "Web Search Fallback" - Use this for general knowledge, current events, or questions about things not related to economics research (e.g. "who is the US president", "weather in London", "latest news").
+
+User Query: "{query}"
+
+Output ONLY the route name ("Calculator", "Local PDF Retrieval", or "Web Search Fallback") without any other text, quotes, or explanation.
+"""
+    try:
+        route_response = chat_model.invoke(route_prompt).content.strip()
+        route_response = route_response.replace('"', '').replace("'", "")
+        if "calculator" in route_response.lower():
+            route = "Calculator"
+        elif "web" in route_response.lower():
+            route = "Web Search Fallback"
+        else:
+            route = "Local PDF Retrieval"
+    except Exception:
+        route = "Local PDF Retrieval"
+
+    details = {}
+    
+    # 2. Check Local Retrieval if that is the route, and see if there are matching documents
+    retrieved_chunks = []
+    if route == "Local PDF Retrieval":
+        if collection.count() > 0:
+            try:
+                result = collection.query(query_texts=[query], n_results=5)
+                distances = result.get('distances', [[]])[0]
+                documents = result.get('documents', [[]])[0]
+                
+                # Similarity/distance threshold < 1.0
+                for dist, doc in zip(distances, documents):
+                    if dist < 1.0:
+                        retrieved_chunks.append(doc)
+            except Exception:
+                pass
+        
+        # If no matching documents, fall back to Web Search
+        if not retrieved_chunks:
+            route = "Web Search Fallback"
+
+    # 3. Process the query based on the final route
+    if route == "Calculator":
+        # Define calculator tool schema
+        @tool
+        def calculator(Exception: str):
+            """ do the calculations based on the user given expression """
+            expr = Exception.strip().strip("'").strip('"')
+            return str(eval(expr))
+            
+        calculator_agent = chat_model.bind_tools([calculator])
+        try:
+            response = calculator_agent.invoke(query)
+            if response.tool_calls:
+                call = response.tool_calls[0]
+                expr = call['args'].get('Exception') or call['args'].get('expression') or list(call['args'].values())[0]
+                # Evaluate expression
+                eval_res = str(eval(str(expr)))
+                answer = f"The result of the calculation `{expr}` is **{eval_res}**."
+            else:
+                answer = response.content if response.content else "No calculation performed."
+        except Exception as e:
+            answer = f"Error performing calculation: {str(e)}"
+            
+    elif route == "Local PDF Retrieval":
+        context = "\n\n".join(retrieved_chunks)
+        prompt = f"""You are an assistant answering questions based on the retrieved context.
+If the context does not contain enough information to answer the question, state that.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+        try:
+            response = chat_model.invoke(prompt)
+            answer = response.content
+        except Exception as e:
+            answer = f"Error generating answer from local retrieval: {str(e)}"
+        details["retrieved_chunks"] = retrieved_chunks
+        
+    else:  # Web Search Fallback
+        search = DuckDuckGoSearchRun()
+        try:
+            search_results = search.run(query)
+        except Exception as e:
+            search_results = f"Web search failed: {str(e)}"
+            
+        prompt = f"""You are an assistant answering questions based on web search results.
+
+Search Results:
+{search_results}
+
+Question: {query}
+
+Answer:"""
+        try:
+            response = chat_model.invoke(prompt)
+            answer = response.content
+        except Exception as e:
+            answer = f"Error generating answer from web search: {str(e)}"
+        details["web_search_results"] = search_results
+
+    metadata = {
+        "route": route,
+        "details": details
+    }
+    
+    state["history"].append({
+        "query": query,
+        "answer": answer,
+        "route": route
+    })
+    
+    return answer, metadata, state
+
 
 # Load environment variables
 load_dotenv()
